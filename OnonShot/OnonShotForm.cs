@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
@@ -11,7 +10,6 @@ namespace OnonShot
 {
     public class OnonShotForm : Dialog
     {
-        private readonly RhinoDoc _doc;
         private readonly Dictionary<string, CheckBox> _checks = new Dictionary<string, CheckBox>();
         private readonly TextBox _folderBox = new TextBox { ReadOnly = true };
         private readonly DropDown _formatBox = new DropDown();
@@ -19,14 +17,38 @@ namespace OnonShot
         private readonly NumericStepper _widthBox = new NumericStepper { MinValue = 16, MaxValue = 16000, Value = 1920, Increment = 10 };
         private readonly NumericStepper _heightBox = new NumericStepper { MinValue = 16, MaxValue = 16000, Value = 1080, Increment = 10 };
         private readonly CheckBox _transparentBox = new CheckBox { Text = "透明背景", Checked = false };
-        private readonly Label _statusLabel = new Label { Text = "" };
         private readonly Button _exportButton = new Button { Text = "開始匯出" };
 
-        public OnonShotForm(RhinoDoc doc, IEnumerable<string> snapshotNames)
+        // Rhino 把「跑指令」跟「Eto 對話框事件」視為兩種不同的忙碌狀態：
+        // 若在對話框按鈕的 Click 事件裡直接呼叫 RhinoApp.RunScript，指令只會被排入佇列、
+        // 不會馬上執行，導致每次擷取畫面時看到的都還是同一個（舊的）場景。
+        // 所以這裡的對話框只負責收集設定，實際匯出動作交給對話框關閉後的 OnonShotCommand 執行。
+        public bool ExportRequested { get; private set; }
+        public List<string> SelectedNames { get; private set; }
+        public string OutputFolder => _folderBox.Text;
+        public ImageFormat Format => _formatBox.SelectedIndex == 0 ? ImageFormat.Png : ImageFormat.Jpeg;
+        public string Extension => _formatBox.SelectedIndex == 0 ? ".png" : ".jpg";
+        public bool Transparent => _transparentBox.Checked == true;
+        public bool MatchViewport => _matchViewport.Checked == true;
+        public int ExportWidth => (int)_widthBox.Value;
+        public int ExportHeight => (int)_heightBox.Value;
+
+        private const string UsageText =
+            "使用說明\n\n" +
+            "1. 先在 Rhino 的 Snapshots 面板（Panels > Snapshots）建立好要輸出的快照。\n" +
+            "2. 執行 ononshot 指令開啟這個視窗。\n" +
+            "3. 勾選要匯出的快照（可用「全選」／「全不選」快速切換）。\n" +
+            "4. 選擇輸出資料夾（會記住上次使用的路徑）。\n" +
+            "5. 選擇圖片格式（PNG 可搭配透明背景）與解析度（預設沿用目前視角尺寸）。\n" +
+            "6. 按「開始匯出」，視窗會先關閉，Rhino 指令列會依序顯示匯出進度。";
+
+        public OnonShotForm(IEnumerable<string> snapshotNames)
         {
-            _doc = doc;
-            Title = "ononshot - 批次匯出場景快照";
+            var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+            Title = $"ononshot v{version.Major}.{version.Minor}.{version.Build} - 批次匯出場景快照";
             Resizable = false;
+
+            _folderBox.Text = OnonShotPlugin.Instance.Settings.GetString("OutputFolder", "");
 
             _formatBox.Items.Add("PNG");
             _formatBox.Items.Add("JPG");
@@ -44,6 +66,9 @@ namespace OnonShot
                 _checks[name] = cb;
                 listLayout.AddRow(cb);
             }
+            // DynamicLayout 預設會把「最後一列」拉伸去吃掉多餘空間，導致最後一個項目上方多一大塊空白。
+            // 補一列真正的空白列在最後面，讓多餘空間被它吸收，勾選框本身維持自然大小、緊密排列。
+            listLayout.AddRow(null);
 
             var selectAll = new Button { Text = "全選" };
             selectAll.Click += (s, e) => SetAllChecked(true);
@@ -56,6 +81,9 @@ namespace OnonShot
             var closeButton = new Button { Text = "關閉" };
             closeButton.Click += (s, e) => Close();
             _exportButton.Click += OnExportClicked;
+
+            var helpButton = new Button { Text = "使用說明" };
+            helpButton.Click += (s, e) => MessageBox.Show(this, UsageText, "ononshot", MessageBoxButtons.OK, MessageBoxType.Information);
 
             var layout = new DynamicLayout { Padding = 12, Spacing = new Eto.Drawing.Size(8, 8) };
 
@@ -86,12 +114,11 @@ namespace OnonShot
             });
             layout.AddRow(_transparentBox);
 
-            layout.AddSeparateRow(_statusLabel);
-            layout.AddRow(new StackLayout
+            layout.AddSeparateRow(new StackLayout
             {
                 Orientation = Orientation.Horizontal,
                 Spacing = 6,
-                Items = { null, _exportButton, closeButton }
+                Items = { helpButton, null, _exportButton, closeButton }
             });
 
             Content = layout;
@@ -121,7 +148,10 @@ namespace OnonShot
             var dlg = new SelectFolderDialog();
             if (!string.IsNullOrEmpty(_folderBox.Text)) dlg.Directory = _folderBox.Text;
             if (dlg.ShowDialog(this) == DialogResult.Ok)
+            {
                 _folderBox.Text = dlg.Directory;
+                OnonShotPlugin.Instance.Settings.SetString("OutputFolder", dlg.Directory);
+            }
         }
 
         private void OnExportClicked(object sender, EventArgs e)
@@ -138,73 +168,9 @@ namespace OnonShot
                 return;
             }
 
-            _exportButton.Enabled = false;
-            var format = _formatBox.SelectedIndex == 0 ? ImageFormat.Png : ImageFormat.Jpeg;
-            var ext = _formatBox.SelectedIndex == 0 ? ".png" : ".jpg";
-            var transparent = _transparentBox.Checked == true;
-            var matchViewport = _matchViewport.Checked == true;
-            var width = (int)_widthBox.Value;
-            var height = (int)_heightBox.Value;
-
-            var view = _doc.Views.ActiveView;
-            var failed = new List<string>();
-            var done = 0;
-
-            foreach (var name in selected)
-            {
-                done++;
-                _statusLabel.Text = $"正在匯出 ({done}/{selected.Count})：{name}";
-                Application.Instance.RunIteration();
-
-                try
-                {
-                    RestoreSnapshot(name);
-
-                    var w = matchViewport ? view.ActiveViewport.Size.Width : width;
-                    var h = matchViewport ? view.ActiveViewport.Size.Height : height;
-
-                    var capture = new Rhino.Display.ViewCapture
-                    {
-                        Width = w,
-                        Height = h,
-                        ScaleScreenItems = false,
-                        DrawAxes = false,
-                        DrawGrid = false,
-                        DrawGridAxes = false,
-                        TransparentBackground = transparent
-                    };
-
-                    using (var bmp = capture.CaptureToBitmap(view))
-                    {
-                        var path = Path.Combine(_folderBox.Text, SanitizeFileName(name) + ext);
-                        bmp.Save(path, format);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    failed.Add($"{name}（{ex.Message}）");
-                }
-            }
-
-            _statusLabel.Text = failed.Count == 0
-                ? $"完成！已匯出 {selected.Count} 張圖片。"
-                : $"完成，但有 {failed.Count} 個失敗：{string.Join("; ", failed)}";
-            _exportButton.Enabled = true;
-        }
-
-        private void RestoreSnapshot(string name)
-        {
-            var escaped = name.Replace("\"", "");
-            var ok = RhinoApp.RunScript($"-Snapshots Restore \"{escaped}\" _Enter _Enter", false);
-            if (!ok) throw new InvalidOperationException("還原快照失敗");
-            _doc.Views.Redraw();
-            Application.Instance.RunIteration();
-        }
-
-        private static string SanitizeFileName(string name)
-        {
-            var invalid = Path.GetInvalidFileNameChars();
-            return new string(name.Select(c => invalid.Contains(c) ? '_' : c).ToArray());
+            SelectedNames = selected;
+            ExportRequested = true;
+            Close();
         }
     }
 }
